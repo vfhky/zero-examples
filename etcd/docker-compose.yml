@@ -1,0 +1,47 @@
+version: '3.8'
+
+services:
+  etcd:
+    image: quay.io/coreos/etcd:v3.5.9
+    container_name: etcd.discovery
+    hostname: etcd.discovery
+    environment:
+      - ETCD_NAME=etcd0
+      - ETCD_INITIAL_ADVERTISE_PEER_URLS=http://0.0.0.0:2380
+      - ETCD_LISTEN_PEER_URLS=http://0.0.0.0:2380
+      - ETCD_LISTEN_CLIENT_URLS=http://0.0.0.0:2379
+      - ETCD_ADVERTISE_CLIENT_URLS=http://0.0.0.0:2379
+      - ETCD_INITIAL_CLUSTER=etcd0=http://0.0.0.0:2380
+      - ALLOW_NONE_AUTHENTICATION=yes
+    ports:
+      - "2379:2379"
+      - "2380:2380"
+    networks:
+      - etcd-net
+
+  pub:
+    build:
+      context: ../
+      dockerfile: etcd/pub/Dockerfile
+    container_name: zero-pub-service
+    depends_on:
+      - etcd
+    restart: unless-stopped
+    command: ["./pub", "-v", "my-service-value"]
+    networks:
+      - etcd-net
+
+  sub:
+    build:
+      context: ../
+      dockerfile: etcd/sub/Dockerfile
+    container_name: zero-sub-service
+    depends_on:
+      - etcd
+    restart: unless-stopped
+    networks:
+      - etcd-net
+
+networks:
+  etcd-net:
+    driver: bridge
