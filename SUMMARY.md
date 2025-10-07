@@ -9,11 +9,27 @@
 - [5. 微服务治理](#5-微服务治理)
 - [6. 并发工具](#6-并发工具)
 - [7. 中间件与拦截器](#7-中间件与拦截器)
+  - [7.1 HTTP 中间件](#71-http-中间件)
+    - [7.1.1 JWT 认证中间件](#711-jwt-认证中间件完整实现)
+  - [7.2 RPC 拦截器](#72-rpc-拦截器)
 - [8. 服务发现](#8-服务发现)
 - [9. 日志与监控](#9-日志与监控)
 - [10. 文件操作](#10-文件操作)
 - [11. 实战项目模板](#11-实战项目模板)
 - [12. 最佳实践](#12-最佳实践)
+  - [12.4.1 Redis 分布式锁防并发](#1241-redis-分布式锁防并发)
+- [13. 性能优化](#13-性能优化)
+- [14. 部署与运维](#14-部署与运维)
+- [15. 项目实战建议](#15-项目实战建议)
+- [16. 常见问题](#16-常见问题)
+- [17. 总结](#17-总结)
+- [18. JWT 认证快速参考](#18-jwt-认证快速参考)
+  - [项目初始化（带 JWT）](#项目初始化带-jwt)
+  - [常用 JWT 代码片段](#常用-jwt-代码片段)
+  - [JWT 配置参数说明](#jwt-配置参数说明)
+  - [常见错误处理](#常见错误处理)
+  - [前端集成示例](#前端集成示例)
+- [19. 总结](#19-总结)
 
 ---
 
@@ -722,6 +738,677 @@ func second(next http.HandlerFunc) http.HandlerFunc {
 
 server.Use(first)
 server.Use(second)
+```
+
+### 7.1.1 JWT 认证中间件（完整实现）
+
+Go-Zero 内置了 JWT 认证支持，可以快速实现基于 Token 的身份验证。
+
+#### 方案一：API 文件中配置 JWT（推荐）
+
+**1. API 定义文件**
+
+```api
+syntax = "v1"
+
+// 登录请求（不需要认证）
+type (
+    LoginReq {
+        Username string `json:"username"`
+        Password string `json:"password"`
+    }
+
+    LoginResp {
+        UserId       int64  `json:"userId"`
+        Username     string `json:"username"`
+        AccessToken  string `json:"accessToken"`
+        RefreshToken string `json:"refreshToken"`
+        ExpireTime   int64  `json:"expireTime"`
+    }
+)
+
+// 用户信息请求（需要认证）
+type (
+    UserInfoReq {
+        UserId int64 `json:"userId"`
+    }
+
+    UserInfoResp {
+        UserId   int64  `json:"userId"`
+        Username string `json:"username"`
+        Email    string `json:"email"`
+        Phone    string `json:"phone"`
+    }
+)
+
+// 修改密码（需要认证）
+type (
+    ChangePasswordReq {
+        OldPassword string `json:"oldPassword"`
+        NewPassword string `json:"newPassword"`
+    }
+
+    ChangePasswordResp {
+        Success bool `json:"success"`
+    }
+)
+
+// 不需要认证的接口
+service user-api {
+    @handler LoginHandler
+    post /user/login (LoginReq) returns (LoginResp)
+
+    @handler RegisterHandler
+    post /user/register (LoginReq) returns (LoginResp)
+}
+
+// 需要 JWT 认证的接口
+@server(
+    jwt: Auth                    // 开启 JWT 认证
+    middleware: LogMiddleware    // 可选：添加日志中间件
+)
+service user-api {
+    @handler UserInfoHandler
+    get /user/info (UserInfoReq) returns (UserInfoResp)
+
+    @handler ChangePasswordHandler
+    post /user/password (ChangePasswordReq) returns (ChangePasswordResp)
+
+    @handler LogoutHandler
+    post /user/logout
+}
+```
+
+**2. 配置文件**
+
+```yaml
+# etc/user-api.yaml
+Name: user-api
+Host: 0.0.0.0
+Port: 8888
+
+# JWT 认证配置
+Auth:
+  AccessSecret: "your-access-secret-key-min-32-chars-long"  # 访问密钥（至少32位）
+  AccessExpire: 7200                                        # 访问令牌过期时间（秒），2小时
+
+Log:
+  ServiceName: user-api
+  Mode: console
+  Level: info
+
+# 数据库配置
+Database:
+  Driver: mysql
+  Source: "root:password@tcp(localhost:3306)/user_db?charset=utf8mb4&parseTime=true"
+
+# Redis 配置
+Redis:
+  Host: localhost:6379
+  Type: node
+  Pass: ""
+```
+
+**3. Config 配置结构**
+
+```go
+// internal/config/config.go
+package config
+
+import (
+    "github.com/zeromicro/go-zero/rest"
+    "github.com/zeromicro/go-zero/core/stores/redis"
+)
+
+type Config struct {
+    rest.RestConf
+
+    // JWT 配置会自动从 yaml 映射
+    Auth struct {
+        AccessSecret string
+        AccessExpire int64
+    }
+
+    Database struct {
+        Driver string
+        Source string
+    }
+
+    Redis redis.RedisConf
+}
+```
+
+**4. 登录 Logic 实现（生成 Token）**
+
+```go
+// internal/logic/loginlogic.go
+package logic
+
+import (
+    "context"
+    "time"
+
+    "user/api/internal/svc"
+    "user/api/internal/types"
+
+    "github.com/golang-jwt/jwt/v4"
+    "github.com/zeromicro/go-zero/core/logx"
+)
+
+type LoginLogic struct {
+    logx.Logger
+    ctx    context.Context
+    svcCtx *svc.ServiceContext
+}
+
+func NewLoginLogic(ctx context.Context, svcCtx *svc.ServiceContext) *LoginLogic {
+    return &LoginLogic{
+        Logger: logx.WithContext(ctx),
+        ctx:    ctx,
+        svcCtx: svcCtx,
+    }
+}
+
+func (l *LoginLogic) Login(req *types.LoginReq) (*types.LoginResp, error) {
+    // 1. 验证用户名密码（这里简化处理，实际应查数据库）
+    if req.Username == "" || req.Password == "" {
+        return nil, fmt.Errorf("用户名或密码不能为空")
+    }
+
+    // 2. 从数据库查询用户
+    // user, err := l.svcCtx.UserModel.FindOneByUsername(l.ctx, req.Username)
+    // if err != nil {
+    //     return nil, fmt.Errorf("用户不存在")
+    // }
+
+    // 3. 验证密码（使用 bcrypt）
+    // if !verifyPassword(req.Password, user.Password) {
+    //     return nil, fmt.Errorf("密码错误")
+    // }
+
+    // 模拟用户数据
+    userId := int64(10001)
+    username := req.Username
+
+    // 4. 生成 JWT Token
+    now := time.Now().Unix()
+    accessExpire := l.svcCtx.Config.Auth.AccessExpire
+    accessToken, err := l.getJwtToken(
+        l.svcCtx.Config.Auth.AccessSecret,
+        now,
+        accessExpire,
+        userId,
+        username,
+    )
+    if err != nil {
+        return nil, err
+    }
+
+    // 5. 生成 Refresh Token（可选，用于刷新访问令牌）
+    refreshToken, err := l.getJwtToken(
+        l.svcCtx.Config.Auth.AccessSecret,
+        now,
+        accessExpire*24*7, // 7天
+        userId,
+        username,
+    )
+    if err != nil {
+        return nil, err
+    }
+
+    return &types.LoginResp{
+        UserId:       userId,
+        Username:     username,
+        AccessToken:  accessToken,
+        RefreshToken: refreshToken,
+        ExpireTime:   now + accessExpire,
+    }, nil
+}
+
+// getJwtToken 生成 JWT Token
+func (l *LoginLogic) getJwtToken(secretKey string, iat, seconds, userId int64, username string) (string, error) {
+    claims := make(jwt.MapClaims)
+    claims["exp"] = iat + seconds    // 过期时间
+    claims["iat"] = iat              // 签发时间
+    claims["userId"] = userId        // 自定义字段：用户ID
+    claims["username"] = username    // 自定义字段：用户名
+
+    token := jwt.New(jwt.SigningMethodHS256)
+    token.Claims = claims
+
+    return token.SignedString([]byte(secretKey))
+}
+```
+
+**5. 需要认证的接口实现（获取用户信息）**
+
+```go
+// internal/logic/userinfologic.go
+package logic
+
+import (
+    "context"
+    "encoding/json"
+
+    "user/api/internal/svc"
+    "user/api/internal/types"
+
+    "github.com/zeromicro/go-zero/core/logx"
+)
+
+type UserInfoLogic struct {
+    logx.Logger
+    ctx    context.Context
+    svcCtx *svc.ServiceContext
+}
+
+func NewUserInfoLogic(ctx context.Context, svcCtx *svc.ServiceContext) *UserInfoLogic {
+    return &UserInfoLogic{
+        Logger: logx.WithContext(ctx),
+        ctx:    ctx,
+        svcCtx: svcCtx,
+    }
+}
+
+func (l *UserInfoLogic) UserInfo(req *types.UserInfoReq) (*types.UserInfoResp, error) {
+    // 1. 从 context 中获取 JWT 中的用户信息
+    // go-zero 会自动将 JWT 中的信息注入到 context 中
+    userId := l.ctx.Value("userId").(json.Number)
+    username := l.ctx.Value("username").(string)
+
+    l.Infof("user info request from userId: %s, username: %s", userId, username)
+
+    // 2. 查询用户详细信息
+    // user, err := l.svcCtx.UserModel.FindOne(l.ctx, userIdInt64)
+    // if err != nil {
+    //     return nil, err
+    // }
+
+    // 模拟返回用户信息
+    userIdInt64, _ := userId.Int64()
+    return &types.UserInfoResp{
+        UserId:   userIdInt64,
+        Username: username,
+        Email:    username + "@example.com",
+        Phone:    "13800138000",
+    }, nil
+}
+```
+
+#### 方案二：自定义 JWT 中间件
+
+如果需要更灵活的控制，可以自定义 JWT 中间件：
+
+**1. 自定义 JWT 中间件**
+
+```go
+// internal/middleware/authmiddleware.go
+package middleware
+
+import (
+    "context"
+    "net/http"
+    "strings"
+
+    "github.com/golang-jwt/jwt/v4"
+    "github.com/zeromicro/go-zero/rest/httpx"
+)
+
+type AuthMiddleware struct {
+    Secret string
+}
+
+func NewAuthMiddleware(secret string) *AuthMiddleware {
+    return &AuthMiddleware{
+        Secret: secret,
+    }
+}
+
+func (m *AuthMiddleware) Handle(next http.HandlerFunc) http.HandlerFunc {
+    return func(w http.ResponseWriter, r *http.Request) {
+        // 1. 从 Header 中获取 Token
+        authHeader := r.Header.Get("Authorization")
+        if authHeader == "" {
+            httpx.Error(w, fmt.Errorf("missing authorization header"))
+            return
+        }
+
+        // 2. 解析 Bearer Token
+        parts := strings.SplitN(authHeader, " ", 2)
+        if len(parts) != 2 || parts[0] != "Bearer" {
+            httpx.Error(w, fmt.Errorf("invalid authorization header"))
+            return
+        }
+
+        tokenString := parts[1]
+
+        // 3. 验证 Token
+        token, err := jwt.Parse(tokenString, func(token *jwt.Token) (interface{}, error) {
+            // 验证签名方法
+            if _, ok := token.Method.(*jwt.SigningMethodHMAC); !ok {
+                return nil, fmt.Errorf("unexpected signing method: %v", token.Header["alg"])
+            }
+            return []byte(m.Secret), nil
+        })
+
+        if err != nil || !token.Valid {
+            httpx.Error(w, fmt.Errorf("invalid token"))
+            return
+        }
+
+        // 4. 提取 Claims
+        if claims, ok := token.Claims.(jwt.MapClaims); ok {
+            // 将用户信息注入到 context
+            ctx := r.Context()
+            ctx = context.WithValue(ctx, "userId", claims["userId"])
+            ctx = context.WithValue(ctx, "username", claims["username"])
+
+            // 传递新的 context
+            r = r.WithContext(ctx)
+        }
+
+        // 5. 继续处理请求
+        next(w, r)
+    }
+}
+```
+
+**2. 注册中间件**
+
+```go
+// internal/svc/servicecontext.go
+package svc
+
+import (
+    "user/api/internal/config"
+    "user/api/internal/middleware"
+
+    "github.com/zeromicro/go-zero/rest"
+)
+
+type ServiceContext struct {
+    Config         config.Config
+    AuthMiddleware rest.Middleware
+}
+
+func NewServiceContext(c config.Config) *ServiceContext {
+    return &ServiceContext{
+        Config:         c,
+        AuthMiddleware: middleware.NewAuthMiddleware(c.Auth.AccessSecret).Handle,
+    }
+}
+```
+
+#### 方案三：Token 刷新机制
+
+**1. 添加刷新 Token API**
+
+```api
+type (
+    RefreshTokenReq {
+        RefreshToken string `json:"refreshToken"`
+    }
+
+    RefreshTokenResp {
+        AccessToken  string `json:"accessToken"`
+        RefreshToken string `json:"refreshToken"`
+        ExpireTime   int64  `json:"expireTime"`
+    }
+)
+
+service user-api {
+    @handler RefreshTokenHandler
+    post /user/refresh (RefreshTokenReq) returns (RefreshTokenResp)
+}
+```
+
+**2. 刷新 Token Logic**
+
+```go
+// internal/logic/refreshtokenlogic.go
+package logic
+
+import (
+    "context"
+    "fmt"
+    "time"
+
+    "user/api/internal/svc"
+    "user/api/internal/types"
+
+    "github.com/golang-jwt/jwt/v4"
+    "github.com/zeromicro/go-zero/core/logx"
+)
+
+type RefreshTokenLogic struct {
+    logx.Logger
+    ctx    context.Context
+    svcCtx *svc.ServiceContext
+}
+
+func NewRefreshTokenLogic(ctx context.Context, svcCtx *svc.ServiceContext) *RefreshTokenLogic {
+    return &RefreshTokenLogic{
+        Logger: logx.WithContext(ctx),
+        ctx:    ctx,
+        svcCtx: svcCtx,
+    }
+}
+
+func (l *RefreshTokenLogic) RefreshToken(req *types.RefreshTokenReq) (*types.RefreshTokenResp, error) {
+    // 1. 验证 Refresh Token
+    token, err := jwt.Parse(req.RefreshToken, func(token *jwt.Token) (interface{}, error) {
+        return []byte(l.svcCtx.Config.Auth.AccessSecret), nil
+    })
+
+    if err != nil || !token.Valid {
+        return nil, fmt.Errorf("invalid refresh token")
+    }
+
+    // 2. 提取用户信息
+    claims, ok := token.Claims.(jwt.MapClaims)
+    if !ok {
+        return nil, fmt.Errorf("invalid token claims")
+    }
+
+    userId := int64(claims["userId"].(float64))
+    username := claims["username"].(string)
+
+    // 3. 检查 Token 是否在黑名单中（可选）
+    // blacklisted, err := l.svcCtx.Redis.Exists("token:blacklist:" + req.RefreshToken)
+    // if blacklisted {
+    //     return nil, fmt.Errorf("token has been revoked")
+    // }
+
+    // 4. 生成新的 Access Token
+    now := time.Now().Unix()
+    accessExpire := l.svcCtx.Config.Auth.AccessExpire
+    accessToken, err := l.getJwtToken(
+        l.svcCtx.Config.Auth.AccessSecret,
+        now,
+        accessExpire,
+        userId,
+        username,
+    )
+    if err != nil {
+        return nil, err
+    }
+
+    // 5. 生成新的 Refresh Token
+    refreshToken, err := l.getJwtToken(
+        l.svcCtx.Config.Auth.AccessSecret,
+        now,
+        accessExpire*24*7,
+        userId,
+        username,
+    )
+    if err != nil {
+        return nil, err
+    }
+
+    return &types.RefreshTokenResp{
+        AccessToken:  accessToken,
+        RefreshToken: refreshToken,
+        ExpireTime:   now + accessExpire,
+    }, nil
+}
+
+func (l *RefreshTokenLogic) getJwtToken(secretKey string, iat, seconds, userId int64, username string) (string, error) {
+    claims := make(jwt.MapClaims)
+    claims["exp"] = iat + seconds
+    claims["iat"] = iat
+    claims["userId"] = userId
+    claims["username"] = username
+
+    token := jwt.New(jwt.SigningMethodHS256)
+    token.Claims = claims
+
+    return token.SignedString([]byte(secretKey))
+}
+```
+
+#### 客户端调用示例
+
+**1. 登录获取 Token**
+
+```bash
+curl -X POST http://localhost:8888/user/login \
+  -H "Content-Type: application/json" \
+  -d '{
+    "username": "admin",
+    "password": "123456"
+  }'
+```
+
+响应：
+```json
+{
+  "userId": 10001,
+  "username": "admin",
+  "accessToken": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...",
+  "refreshToken": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...",
+  "expireTime": 1696752000
+}
+```
+
+**2. 使用 Token 访问受保护接口**
+
+```bash
+curl -X GET http://localhost:8888/user/info?userId=10001 \
+  -H "Authorization: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9..."
+```
+
+**3. 刷新 Token**
+
+```bash
+curl -X POST http://localhost:8888/user/refresh \
+  -H "Content-Type: application/json" \
+  -d '{
+    "refreshToken": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9..."
+  }'
+```
+
+#### JWT 最佳实践
+
+**1. Token 安全存储**
+
+```go
+// 使用 Redis 存储 Token 黑名单
+func (l *LogoutLogic) Logout(req *types.LogoutReq) error {
+    // 将 Token 加入黑名单
+    token := l.ctx.Value("token").(string)
+
+    // 获取 Token 剩余过期时间
+    claims := l.ctx.Value("claims").(jwt.MapClaims)
+    exp := int64(claims["exp"].(float64))
+    now := time.Now().Unix()
+    ttl := exp - now
+
+    if ttl > 0 {
+        key := fmt.Sprintf("token:blacklist:%s", token)
+        err := l.svcCtx.Redis.Setex(key, "1", int(ttl))
+        if err != nil {
+            return err
+        }
+    }
+
+    return nil
+}
+```
+
+**2. Token 权限控制**
+
+```go
+// 在 JWT Claims 中添加角色信息
+func (l *LoginLogic) getJwtToken(secretKey string, iat, seconds, userId int64, username string, roles []string) (string, error) {
+    claims := make(jwt.MapClaims)
+    claims["exp"] = iat + seconds
+    claims["iat"] = iat
+    claims["userId"] = userId
+    claims["username"] = username
+    claims["roles"] = roles  // 添加角色信息
+
+    token := jwt.New(jwt.SigningMethodHS256)
+    token.Claims = claims
+
+    return token.SignedString([]byte(secretKey))
+}
+
+// 权限检查中间件
+func CheckPermission(requiredRole string) rest.Middleware {
+    return func(next http.HandlerFunc) http.HandlerFunc {
+        return func(w http.ResponseWriter, r *http.Request) {
+            roles := r.Context().Value("roles").([]interface{})
+
+            hasPermission := false
+            for _, role := range roles {
+                if role.(string) == requiredRole {
+                    hasPermission = true
+                    break
+                }
+            }
+
+            if !hasPermission {
+                httpx.Error(w, fmt.Errorf("permission denied"))
+                return
+            }
+
+            next(w, r)
+        }
+    }
+}
+```
+
+**3. Token 过期策略**
+
+```go
+const (
+    // Access Token: 2小时
+    AccessTokenExpire = 7200
+
+    // Refresh Token: 7天
+    RefreshTokenExpire = 604800
+
+    // Remember Me Token: 30天
+    RememberMeTokenExpire = 2592000
+)
+```
+
+**4. 密码加密**
+
+```go
+import "golang.org/x/crypto/bcrypt"
+
+// 加密密码
+func HashPassword(password string) (string, error) {
+    bytes, err := bcrypt.GenerateFromPassword([]byte(password), bcrypt.DefaultCost)
+    return string(bytes), err
+}
+
+// 验证密码
+func VerifyPassword(password, hash string) bool {
+    err := bcrypt.CompareHashAndPassword([]byte(hash), []byte(password))
+    return err == nil
+}
 ```
 
 ### 7.2 RPC 拦截器
@@ -2195,7 +2882,242 @@ sqlx.NewMysql("user:pass@tcp(host:3306)/db?charset=utf8mb4&parseTime=true")
 
 ---
 
-## 17. 总结
+## 18. JWT 认证快速参考
+
+### 项目初始化（带 JWT）
+
+```bash
+# 1. 创建项目
+mkdir my-auth-project && cd my-auth-project
+go mod init my-auth-project
+
+# 2. 创建 API 文件
+cat > user.api << 'EOF'
+syntax = "v1"
+
+type LoginReq {
+    Username string `json:"username"`
+    Password string `json:"password"`
+}
+
+type LoginResp {
+    AccessToken string `json:"accessToken"`
+    ExpireTime  int64  `json:"expireTime"`
+}
+
+type UserInfoResp {
+    UserId   int64  `json:"userId"`
+    Username string `json:"username"`
+}
+
+service user-api {
+    @handler LoginHandler
+    post /user/login (LoginReq) returns (LoginResp)
+}
+
+@server(
+    jwt: Auth
+)
+service user-api {
+    @handler UserInfoHandler
+    get /user/info returns (UserInfoResp)
+}
+EOF
+
+# 3. 生成代码
+goctl api go -api user.api -dir .
+
+# 4. 配置 JWT
+cat > etc/user-api.yaml << 'EOF'
+Name: user-api
+Host: 0.0.0.0
+Port: 8888
+
+Auth:
+  AccessSecret: "your-secret-key-at-least-32-characters-long"
+  AccessExpire: 7200
+EOF
+
+# 5. 安装依赖
+go mod tidy
+```
+
+### 常用 JWT 代码片段
+
+**生成 Token**
+```go
+import "github.com/golang-jwt/jwt/v4"
+
+func GenerateToken(secret string, userId int64, username string, expire int64) (string, error) {
+    now := time.Now().Unix()
+    claims := make(jwt.MapClaims)
+    claims["exp"] = now + expire
+    claims["iat"] = now
+    claims["userId"] = userId
+    claims["username"] = username
+
+    token := jwt.New(jwt.SigningMethodHS256)
+    token.Claims = claims
+
+    return token.SignedString([]byte(secret))
+}
+```
+
+**从 Context 获取用户信息**
+```go
+func GetUserIdFromContext(ctx context.Context) int64 {
+    userId := ctx.Value("userId").(json.Number)
+    userIdInt64, _ := userId.Int64()
+    return userIdInt64
+}
+
+func GetUsernameFromContext(ctx context.Context) string {
+    return ctx.Value("username").(string)
+}
+```
+
+**密码加密工具**
+```go
+import "golang.org/x/crypto/bcrypt"
+
+func HashPassword(password string) (string, error) {
+    bytes, err := bcrypt.GenerateFromPassword([]byte(password), 14)
+    return string(bytes), err
+}
+
+func CheckPassword(password, hash string) bool {
+    err := bcrypt.CompareHashAndPassword([]byte(hash), []byte(password))
+    return err == nil
+}
+```
+
+### JWT 配置参数说明
+
+| 参数 | 类型 | 说明 | 推荐值 |
+|-----|------|------|--------|
+| AccessSecret | string | JWT 签名密钥 | 至少32位随机字符串 |
+| AccessExpire | int64 | Token 过期时间（秒） | 7200（2小时） |
+
+### 常见错误处理
+
+```go
+// 统一的 JWT 错误响应
+type JWTError struct {
+    Code int    `json:"code"`
+    Msg  string `json:"msg"`
+}
+
+const (
+    CodeTokenExpired     = 401001 // Token 已过期
+    CodeTokenInvalid     = 401002 // Token 无效
+    CodeTokenMissing     = 401003 // Token 缺失
+    CodePermissionDenied = 403001 // 权限不足
+)
+
+// 自定义错误处理
+httpx.SetErrorHandler(func(err error) (int, interface{}) {
+    if strings.Contains(err.Error(), "token") {
+        return http.StatusUnauthorized, JWTError{
+            Code: CodeTokenInvalid,
+            Msg:  "认证失败，请重新登录",
+        }
+    }
+    return http.StatusInternalServerError, err
+})
+```
+
+### 前端集成示例
+
+**JavaScript/React**
+```javascript
+// 登录
+async function login(username, password) {
+    const response = await fetch('http://localhost:8888/user/login', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ username, password })
+    });
+
+    const data = await response.json();
+    // 保存 token 到 localStorage
+    localStorage.setItem('accessToken', data.accessToken);
+    return data;
+}
+
+// 带 Token 的请求
+async function getUserInfo() {
+    const token = localStorage.getItem('accessToken');
+
+    const response = await fetch('http://localhost:8888/user/info', {
+        headers: {
+            'Authorization': `Bearer ${token}`
+        }
+    });
+
+    return await response.json();
+}
+
+// Axios 拦截器
+import axios from 'axios';
+
+// 请求拦截器
+axios.interceptors.request.use(config => {
+    const token = localStorage.getItem('accessToken');
+    if (token) {
+        config.headers.Authorization = `Bearer ${token}`;
+    }
+    return config;
+});
+
+// 响应拦截器
+axios.interceptors.response.use(
+    response => response,
+    error => {
+        if (error.response?.status === 401) {
+            // Token 过期，跳转登录
+            localStorage.removeItem('accessToken');
+            window.location.href = '/login';
+        }
+        return Promise.reject(error);
+    }
+);
+```
+
+**Vue 3**
+```javascript
+// composables/useAuth.js
+import { ref } from 'vue';
+import { useRouter } from 'vue-router';
+
+export function useAuth() {
+    const router = useRouter();
+    const token = ref(localStorage.getItem('accessToken'));
+
+    const login = async (username, password) => {
+        const response = await fetch('/user/login', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ username, password })
+        });
+
+        const data = await response.json();
+        token.value = data.accessToken;
+        localStorage.setItem('accessToken', data.accessToken);
+    };
+
+    const logout = () => {
+        token.value = null;
+        localStorage.removeItem('accessToken');
+        router.push('/login');
+    };
+
+    return { token, login, logout };
+}
+```
+
+---
+
+## 19. 总结
 
 Go-Zero 是一个功能强大、设计优雅的微服务框架，具有以下核心优势：
 
