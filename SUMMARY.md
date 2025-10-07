@@ -1384,6 +1384,525 @@ type BookModel interface {
 goctl model mysql ddl -src schema.sql -dir model -c
 ```
 
+### 12.4.1 Redis 分布式锁防并发
+
+在分布式系统中，对于同一个订单或业务ID的并发请求，需要使用分布式锁来保证幂等性。Go-Zero 提供了 Redis 的 SETNX 实现。
+
+#### 方案一：使用 RedisLock（推荐）
+
+**1. 在 ServiceContext 中初始化 Redis**
+
+```go
+// internal/config/config.go
+package config
+
+import (
+    "github.com/zeromicro/go-zero/rest"
+    "github.com/zeromicro/go-zero/core/stores/redis"
+)
+
+type Config struct {
+    rest.RestConf
+
+    Redis redis.RedisConf  // Redis 配置
+
+    // RPC 配置
+    Add   zrpc.RpcClientConf
+    Check zrpc.RpcClientConf
+}
+```
+
+```go
+// internal/svc/servicecontext.go
+package svc
+
+import (
+    "bookstore/api/internal/config"
+    "bookstore/rpc/add/adder"
+    "bookstore/rpc/check/checker"
+
+    "github.com/zeromicro/go-zero/core/stores/redis"
+    "github.com/zeromicro/go-zero/zrpc"
+)
+
+type ServiceContext struct {
+    Config  config.Config
+    Redis   *redis.Redis      // Redis 客户端
+    Adder   adder.Adder
+    Checker checker.Checker
+}
+
+func NewServiceContext(c config.Config) *ServiceContext {
+    return &ServiceContext{
+        Config:  c,
+        Redis:   redis.MustNewRedis(c.Redis),  // 初始化 Redis
+        Adder:   adder.NewAdder(zrpc.MustNewClient(c.Add)),
+        Checker: checker.NewChecker(zrpc.MustNewClient(c.Check)),
+    }
+}
+```
+
+**2. 配置文件添加 Redis**
+
+```yaml
+# etc/bookstore-api.yaml
+Name: bookstore-api
+Host: 0.0.0.0
+Port: 8888
+
+# Redis 配置
+Redis:
+  Host: localhost:6379
+  Type: node           # node | cluster
+  Pass: ""             # 密码（可选）
+
+Log:
+  ServiceName: bookstore-api
+  Mode: file
+  Path: logs/api
+  Level: info
+
+Add:
+  Etcd:
+    Hosts:
+      - localhost:2379
+    Key: add.rpc
+
+Check:
+  Etcd:
+    Hosts:
+      - localhost:2379
+    Key: check.rpc
+```
+
+**3. 在 Logic 中使用分布式锁**
+
+```go
+// internal/logic/addlogic.go
+package logic
+
+import (
+    "context"
+    "fmt"
+    "time"
+
+    "bookstore/api/internal/svc"
+    "bookstore/api/internal/types"
+    "bookstore/rpc/add/adder"
+
+    "github.com/zeromicro/go-zero/core/logx"
+    "github.com/zeromicro/go-zero/core/stores/redis"
+)
+
+type AddLogic struct {
+    logx.Logger
+    ctx    context.Context
+    svcCtx *svc.ServiceContext
+}
+
+func NewAddLogic(ctx context.Context, svcCtx *svc.ServiceContext) AddLogic {
+    return AddLogic{
+        Logger: logx.WithContext(ctx),
+        ctx:    ctx,
+        svcCtx: svcCtx,
+    }
+}
+
+func (l *AddLogic) Add(req types.AddReq) (*types.AddResp, error) {
+    // 1. 构建分布式锁的 key（使用业务唯一标识）
+    lockKey := fmt.Sprintf("lock:add:book:%s", req.Book)
+
+    // 2. 创建 RedisLock
+    redisLock := redis.NewRedisLock(l.svcCtx.Redis, lockKey)
+
+    // 设置锁的过期时间（防止死锁）
+    redisLock.SetExpire(10) // 10秒过期
+
+    // 3. 尝试获取锁
+    acquired, err := redisLock.Acquire()
+    if err != nil {
+        l.Errorf("acquire lock failed, error: %v", err)
+        return nil, fmt.Errorf("系统繁忙，请稍后重试")
+    }
+
+    if !acquired {
+        // 未获取到锁，说明有并发请求正在处理
+        l.Infof("book %s is being processed by another request", req.Book)
+        return nil, fmt.Errorf("请求处理中，请勿重复提交")
+    }
+
+    // 4. 确保释放锁
+    defer func() {
+        released, err := redisLock.Release()
+        if err != nil {
+            l.Errorf("release lock failed, error: %v", err)
+        }
+        if released {
+            l.Infof("lock released for book: %s", req.Book)
+        }
+    }()
+
+    // 5. 执行业务逻辑
+    l.Infof("processing add book request: %s", req.Book)
+
+    // 调用 RPC 服务
+    resp, err := l.svcCtx.Adder.Add(l.ctx, &adder.AddReq{
+        Book:  req.Book,
+        Price: req.Price,
+    })
+    if err != nil {
+        l.Errorf("call rpc failed, error: %v", err)
+        return nil, err
+    }
+
+    return &types.AddResp{
+        Ok: resp.Ok,
+    }, nil
+}
+```
+
+#### 方案二：订单场景完整示例
+
+**订单 API 定义**
+
+```api
+// order.api
+syntax = "v1"
+
+type (
+    CreateOrderReq {
+        OrderId   string  `json:"orderId"`    // 订单唯一ID（客户端生成）
+        UserId    int64   `json:"userId"`
+        ProductId int64   `json:"productId"`
+        Amount    float64 `json:"amount"`
+    }
+
+    CreateOrderResp {
+        Success bool   `json:"success"`
+        OrderId string `json:"orderId"`
+        Message string `json:"message"`
+    }
+)
+
+service order-api {
+    @handler CreateOrderHandler
+    post /order/create (CreateOrderReq) returns (CreateOrderResp)
+}
+```
+
+**订单 Logic 实现**
+
+```go
+// internal/logic/createorderlogic.go
+package logic
+
+import (
+    "context"
+    "fmt"
+    "time"
+
+    "order/api/internal/svc"
+    "order/api/internal/types"
+
+    "github.com/zeromicro/go-zero/core/logx"
+    "github.com/zeromicro/go-zero/core/stores/redis"
+)
+
+const (
+    // 订单锁前缀
+    OrderLockPrefix = "lock:order:create:"
+    // 锁过期时间（秒）
+    OrderLockExpire = 30
+    // 订单处理结果缓存时间（秒）
+    OrderResultExpire = 3600
+)
+
+type CreateOrderLogic struct {
+    logx.Logger
+    ctx    context.Context
+    svcCtx *svc.ServiceContext
+}
+
+func NewCreateOrderLogic(ctx context.Context, svcCtx *svc.ServiceContext) *CreateOrderLogic {
+    return &CreateOrderLogic{
+        Logger: logx.WithContext(ctx),
+        ctx:    ctx,
+        svcCtx: svcCtx,
+    }
+}
+
+func (l *CreateOrderLogic) CreateOrder(req *types.CreateOrderReq) (*types.CreateOrderResp, error) {
+    // 1. 参数校验
+    if req.OrderId == "" {
+        return nil, fmt.Errorf("订单ID不能为空")
+    }
+
+    // 2. 先检查订单是否已存在（幂等性检查）
+    resultKey := fmt.Sprintf("order:result:%s", req.OrderId)
+    existResult, err := l.svcCtx.Redis.Get(resultKey)
+    if err != nil && err != redis.Nil {
+        l.Errorf("check order result failed, error: %v", err)
+    }
+    if existResult != "" {
+        // 订单已处理过，直接返回
+        return &types.CreateOrderResp{
+            Success: true,
+            OrderId: req.OrderId,
+            Message: "订单已创建（幂等返回）",
+        }, nil
+    }
+
+    // 3. 获取分布式锁
+    lockKey := OrderLockPrefix + req.OrderId
+    redisLock := redis.NewRedisLock(l.svcCtx.Redis, lockKey)
+    redisLock.SetExpire(OrderLockExpire)
+
+    acquired, err := redisLock.Acquire()
+    if err != nil {
+        l.Errorf("acquire lock failed, orderId: %s, error: %v", req.OrderId, err)
+        return nil, fmt.Errorf("系统繁忙，请稍后重试")
+    }
+
+    if !acquired {
+        l.Warnf("order is being processed, orderId: %s", req.OrderId)
+        return nil, fmt.Errorf("订单正在处理中，请勿重复提交")
+    }
+
+    // 4. 确保释放锁
+    defer func() {
+        released, err := redisLock.Release()
+        if err != nil {
+            l.Errorf("release lock failed, orderId: %s, error: %v", req.OrderId, err)
+        } else if released {
+            l.Infof("lock released, orderId: %s", req.OrderId)
+        }
+    }()
+
+    // 5. 再次检查订单是否已存在（双重检查）
+    existResult, err = l.svcCtx.Redis.Get(resultKey)
+    if err != nil && err != redis.Nil {
+        l.Errorf("double check order result failed, error: %v", err)
+    }
+    if existResult != "" {
+        return &types.CreateOrderResp{
+            Success: true,
+            OrderId: req.OrderId,
+            Message: "订单已创建（双重检查）",
+        }, nil
+    }
+
+    // 6. 执行业务逻辑（创建订单）
+    l.Infof("creating order, orderId: %s, userId: %d, productId: %d",
+        req.OrderId, req.UserId, req.ProductId)
+
+    // 模拟业务处理
+    time.Sleep(time.Second * 2)
+
+    // TODO: 调用 RPC 服务创建订单
+    // resp, err := l.svcCtx.OrderRpc.CreateOrder(l.ctx, &order.CreateOrderReq{...})
+
+    // 7. 缓存处理结果（防止重复请求）
+    err = l.svcCtx.Redis.Setex(resultKey, "success", OrderResultExpire)
+    if err != nil {
+        l.Errorf("cache order result failed, error: %v", err)
+    }
+
+    return &types.CreateOrderResp{
+        Success: true,
+        OrderId: req.OrderId,
+        Message: "订单创建成功",
+    }, nil
+}
+```
+
+#### 方案三：使用 SETNX 原生命令
+
+如果需要更灵活的控制，也可以直接使用 Redis 的原生命令：
+
+```go
+package logic
+
+import (
+    "context"
+    "fmt"
+    "time"
+
+    "github.com/zeromicro/go-zero/core/logx"
+    "github.com/zeromicro/go-zero/core/stores/redis"
+)
+
+type CustomLockLogic struct {
+    logx.Logger
+    ctx    context.Context
+    svcCtx *svc.ServiceContext
+}
+
+// TryLockWithRetry 尝试获取锁（带重试）
+func (l *CustomLockLogic) TryLockWithRetry(bizId string, expireSeconds int, maxRetry int) (bool, error) {
+    lockKey := fmt.Sprintf("lock:biz:%s", bizId)
+    lockValue := fmt.Sprintf("%d", time.Now().UnixNano()) // 使用时间戳作为锁值
+
+    for i := 0; i < maxRetry; i++ {
+        // SETNX + EXPIRE 原子操作
+        ok, err := l.svcCtx.Redis.SetnxEx(lockKey, lockValue, expireSeconds)
+        if err != nil {
+            l.Errorf("setnx failed, key: %s, error: %v", lockKey, err)
+            return false, err
+        }
+
+        if ok {
+            l.Infof("lock acquired, key: %s, value: %s", lockKey, lockValue)
+            return true, nil
+        }
+
+        // 未获取到锁，等待后重试
+        if i < maxRetry-1 {
+            time.Sleep(time.Millisecond * 100)
+        }
+    }
+
+    return false, nil
+}
+
+// ReleaseLock 释放锁（使用 Lua 脚本保证原子性）
+func (l *CustomLockLogic) ReleaseLock(bizId, lockValue string) error {
+    lockKey := fmt.Sprintf("lock:biz:%s", bizId)
+
+    // Lua 脚本：只有持有锁的客户端才能释放
+    script := `
+        if redis.call("get", KEYS[1]) == ARGV[1] then
+            return redis.call("del", KEYS[1])
+        else
+            return 0
+        end
+    `
+
+    _, err := l.svcCtx.Redis.Eval(script, []string{lockKey}, lockValue)
+    if err != nil {
+        l.Errorf("release lock failed, key: %s, error: %v", lockKey, err)
+        return err
+    }
+
+    l.Infof("lock released, key: %s", lockKey)
+    return nil
+}
+
+// ProcessWithLock 使用自定义锁处理业务
+func (l *CustomLockLogic) ProcessWithLock(bizId string) error {
+    // 1. 尝试获取锁（3次重试）
+    acquired, err := l.TryLockWithRetry(bizId, 10, 3)
+    if err != nil {
+        return err
+    }
+    if !acquired {
+        return fmt.Errorf("获取锁失败，请稍后重试")
+    }
+
+    lockValue := fmt.Sprintf("%d", time.Now().UnixNano())
+
+    // 2. 确保释放锁
+    defer func() {
+        if err := l.ReleaseLock(bizId, lockValue); err != nil {
+            l.Errorf("release lock error: %v", err)
+        }
+    }()
+
+    // 3. 执行业务逻辑
+    l.Infof("processing business, bizId: %s", bizId)
+    // TODO: 业务处理
+
+    return nil
+}
+```
+
+#### 最佳实践总结
+
+**1. 锁的 Key 设计**
+```go
+// 订单锁
+lockKey := fmt.Sprintf("lock:order:%s", orderId)
+
+// 支付锁
+lockKey := fmt.Sprintf("lock:payment:%s:%s", orderId, userId)
+
+// 库存锁
+lockKey := fmt.Sprintf("lock:stock:%d", productId)
+
+// 业务流水号锁
+lockKey := fmt.Sprintf("lock:biz:%s", bizNo)
+```
+
+**2. 锁的过期时间设置**
+```go
+const (
+    // 快速操作：5秒
+    QuickLockExpire = 5
+
+    // 一般操作：10秒
+    NormalLockExpire = 10
+
+    // 复杂操作：30秒
+    ComplexLockExpire = 30
+
+    // 最大不超过：60秒
+    MaxLockExpire = 60
+)
+```
+
+**3. 完整的防并发方案**
+```go
+func (l *Logic) HandleRequest(req Request) (*Response, error) {
+    // Step 1: 幂等性检查（快速失败）
+    if exists := l.checkIfProcessed(req.BizId); exists {
+        return l.getProcessedResult(req.BizId), nil
+    }
+
+    // Step 2: 获取分布式锁
+    lock := redis.NewRedisLock(l.svcCtx.Redis, "lock:"+req.BizId)
+    lock.SetExpire(30)
+
+    acquired, err := lock.Acquire()
+    if err != nil {
+        return nil, err
+    }
+    if !acquired {
+        return nil, fmt.Errorf("请求处理中，请勿重复提交")
+    }
+    defer lock.Release()
+
+    // Step 3: 双重检查
+    if exists := l.checkIfProcessed(req.BizId); exists {
+        return l.getProcessedResult(req.BizId), nil
+    }
+
+    // Step 4: 执行业务逻辑
+    result := l.processBusiness(req)
+
+    // Step 5: 缓存结果
+    l.cacheResult(req.BizId, result)
+
+    return result, nil
+}
+```
+
+**4. 错误处理**
+```go
+// 区分不同的错误类型
+var (
+    ErrLockFailed     = errors.New("获取锁失败")
+    ErrDuplicateReq   = errors.New("请求重复提交")
+    ErrSystemBusy     = errors.New("系统繁忙")
+)
+
+// 返回友好的错误信息给客户端
+if err == ErrDuplicateReq {
+    return &Response{
+        Code: 409,
+        Msg:  "请求正在处理中，请勿重复提交",
+    }
+}
+```
+
 ### 12.5 性能优化
 
 **连接池配置**
