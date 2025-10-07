@@ -1,6 +1,17 @@
 Name: bookstore-api
 Host: 0.0.0.0
 Port: 8888
+
+# 日志配置
+Log:
+  ServiceName: bookstore-api
+  Mode: file                    # 日志模式: console(控制台) 或 file(文件) 或 volume(docker volume)
+  Path: logs/api               # 日志文件路径
+  Level: info                   # 日志级别: debug, info, error, severe
+  Compress: true                # 是否压缩
+  KeepDays: 7                   # 日志保留天数
+  StackCooldownMillis: 100      # 堆栈日志冷却时间(毫秒)
+
 Add:
   Etcd:
     Hosts:
